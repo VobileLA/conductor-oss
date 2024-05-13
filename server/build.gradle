@@ -24,19 +24,14 @@ dependencies {
     implementation project(':conductor-amqp')
     implementation project(':conductor-nats')
     implementation project(':conductor-nats-streaming')
-    implementation project(':conductor-awssqs-event-queue')
 
     //External Payload Storage
-    implementation project(':conductor-azureblob-storage')
     implementation project(':conductor-postgres-external-storage')
-    implementation project(':conductor-awss3-storage')
 
 
     //Persistence
     implementation project(':conductor-redis-persistence')
-    implementation project(':conductor-cassandra-persistence')
     implementation project(':conductor-postgres-persistence')
-    implementation project(':conductor-mysql-persistence')
 
     //Indexing (note: Elasticsearch 6 is deprecated)
     implementation project(':conductor-es7-persistence')
