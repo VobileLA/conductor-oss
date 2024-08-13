@@ -2,7 +2,7 @@ name: Dev Deploy to GCP - GKE
 
 env: 
   IMAGE_NAME: conductor-oss
-  CONDUCTOR_VERSION: 3.19.0
+  CONDUCTOR_VERSION: 3.21.3
   PROJECT_ID: vt-next-generation-346622
   GAR_LOCATION: us-east1 
   REPOSITORY: conductor-server
