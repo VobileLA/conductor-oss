@@ -50,5 +50,5 @@ jobs:
         IMAGE_TAG: 3.21.17
         REPO_NAME: conductor-server-oss
       run: |
-        docker build --no-cache -t $ECR_REGISTRY/${{ env.REPO_NAME }}:1.0.$IMAGE_TAG -f docker/server/Dockerfile  .
+        docker build --no-cache -t $ECR_REGISTRY/${{ env.REPO_NAME }}:$IMAGE_TAG -f docker/server/Dockerfile  .
         docker push $ECR_REGISTRY/${{ env.REPO_NAME }}:$IMAGE_TAG
