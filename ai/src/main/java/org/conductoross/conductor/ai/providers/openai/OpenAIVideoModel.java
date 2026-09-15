@@ -20,6 +20,7 @@ import org.conductoross.conductor.ai.providers.openai.api.OpenAIVideoApi;
 import org.conductoross.conductor.ai.video.*;
 
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
 
 /**
  * OpenAI Sora video model implementation.
@@ -39,9 +40,11 @@ import lombok.extern.slf4j.Slf4j;
 public class OpenAIVideoModel implements AsyncVideoModel {
 
     private final OpenAIVideoApi api;
+    private final OkHttpClient httpClient;
 
-    public OpenAIVideoModel(OpenAIVideoApi api) {
+    public OpenAIVideoModel(OpenAIVideoApi api, OkHttpClient httpClient) {
         this.api = api;
+        this.httpClient = httpClient;
     }
 
     @Override
@@ -102,10 +105,10 @@ public class OpenAIVideoModel implements AsyncVideoModel {
 
             if ("completed".equals(status.status())) {
                 // Download the video MP4 as bytes
+                // Use direct byte storage to avoid base64 encoding overhead (~33% memory savings)
                 byte[] videoBytes = api.downloadVideo(jobId);
-                String videoB64 = Base64.getEncoder().encodeToString(videoBytes);
 
-                Video video = new Video(null, videoB64, "video/mp4");
+                Video video = Video.fromBytes(videoBytes, "video/mp4");
                 VideoGeneration generation = new VideoGeneration(video);
 
                 List<VideoGeneration> generations = new ArrayList<>();
@@ -114,8 +117,7 @@ public class OpenAIVideoModel implements AsyncVideoModel {
                 // Optionally download thumbnail (OpenAI returns webp thumbnails)
                 try {
                     byte[] thumbnailBytes = api.downloadThumbnail(jobId);
-                    String thumbnailB64 = Base64.getEncoder().encodeToString(thumbnailBytes);
-                    Video thumbnail = new Video(null, thumbnailB64, "image/webp");
+                    Video thumbnail = Video.fromBytes(thumbnailBytes, "image/webp");
                     generations.add(new VideoGeneration(thumbnail));
                 } catch (Exception e) {
                     log.debug(
@@ -198,9 +200,8 @@ public class OpenAIVideoModel implements AsyncVideoModel {
     }
 
     private byte[] downloadFromUrl(String url) {
-        okhttp3.OkHttpClient client = new okhttp3.OkHttpClient();
         okhttp3.Request request = new okhttp3.Request.Builder().url(url).get().build();
-        try (okhttp3.Response response = client.newCall(request).execute()) {
+        try (okhttp3.Response response = httpClient.newCall(request).execute()) {
             if (response.body() == null) {
                 throw new RuntimeException("Empty response downloading image from " + url);
             }
