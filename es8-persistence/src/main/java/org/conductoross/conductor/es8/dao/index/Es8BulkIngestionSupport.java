@@ -31,14 +31,19 @@ import org.springframework.retry.support.RetryTemplate;
 
 import com.netflix.conductor.metrics.Monitors;
 
+import org.elasticsearch.client.ResponseException;
+
 import co.elastic.clients.elasticsearch.ElasticsearchAsyncClient;
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._helpers.bulk.BulkIngester;
 import co.elastic.clients.elasticsearch._helpers.bulk.BulkListener;
+import co.elastic.clients.elasticsearch._types.ElasticsearchException;
+import co.elastic.clients.elasticsearch._types.ErrorCause;
 import co.elastic.clients.elasticsearch._types.Refresh;
 import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
+import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 
 /**
      * Owns async bulk ingestion for ES8 index and partial-update writes. Archival updates share
@@ -50,6 +55,12 @@ class Es8BulkIngestionSupport {
 
     /** Flush a batch early when full workflow documents would make it too large for one request. */
     private static final long BULK_MAX_BYTES = 10L * 1024 * 1024;
+
+    /**
+     * One bulk in flight per document type per server. Four in-flight bulks on six servers filled
+     * the Elasticsearch hot-node write queue and its coordinating-bytes limit.
+     */
+    private static final int MAX_CONCURRENT_BULK_REQUESTS = 1;
 
     private final ElasticsearchClient elasticSearchClient;
     private final ElasticsearchAsyncClient elasticSearchAsyncClient;
@@ -242,14 +253,15 @@ class Es8BulkIngestionSupport {
                         if (response.errors()) {
                             List<BulkOperation> failedOperations =
                                     collectFailedOperations(request, response);
-                            long errorCount = failedOperations.size();
+                            List<BulkOperation> retryable = operationsToRetry(request, response);
                             Monitors.error(className, "index");
                             logger.warn(
-                                    "Bulk indexing reported {} failures for doc type {} ({} items)",
-                                    errorCount,
+                                    "Bulk indexing reported {} failures for doc type {} ({} items, {} retryable)",
+                                    failedOperations.size(),
                                     docType,
-                                    response.items().size());
-                            retryFailedOperations(docType, failedOperations);
+                                    response.items().size(),
+                                    retryable.size());
+                            retryFailedOperations(docType, retryable);
                         }
                     }
 
@@ -264,18 +276,24 @@ class Es8BulkIngestionSupport {
                             Monitors.recordESIndexTime("index_object", docType, duration);
                         }
                         Monitors.error(className, "index");
-                        logger.error("Bulk indexing failed for doc type {}", docType, failure);
-                        try {
-                            retryTemplate.execute(
-                                    context -> {
-                                        elasticSearchClient.bulk(request);
-                                        return null;
-                                    });
-                        } catch (Exception retryException) {
-                            logger.error(
-                                    "Bulk indexing retry failed for doc type {}",
-                                    docType,
-                                    retryException);
+                        if (isTooManyRequests(failure)) {
+                            logger.warn(
+                                    "Bulk indexing rejected by Elasticsearch for doc type {}; not retrying",
+                                    docType);
+                        } else {
+                            logger.error("Bulk indexing failed for doc type {}", docType, failure);
+                            try {
+                                retryTemplate.execute(
+                                        context -> {
+                                            elasticSearchClient.bulk(request);
+                                            return null;
+                                        });
+                            } catch (Exception retryException) {
+                                logger.error(
+                                        "Bulk indexing retry failed for doc type {}",
+                                        docType,
+                                        retryException);
+                            }
                         }
                         Monitors.recordWorkerQueueSize(
                                 "indexQueue",
@@ -291,8 +309,7 @@ class Es8BulkIngestionSupport {
                     builder.client(elasticSearchAsyncClient);
                     builder.maxOperations(indexBatchSize);
                     builder.maxSize(BULK_MAX_BYTES);
-                    builder.maxConcurrentRequests(
-                            Math.max(1, Math.min(4, properties.getAsyncMaxPoolSize())));
+                    builder.maxConcurrentRequests(MAX_CONCURRENT_BULK_REQUESTS);
                     if (asyncBufferFlushTimeout > 0) {
                         builder.flushInterval(
                                 asyncBufferFlushTimeout, TimeUnit.SECONDS, bulkScheduler);
@@ -326,6 +343,50 @@ class Es8BulkIngestionSupport {
             }
         }
         return failedOperations;
+    }
+
+    /** Failed items Elasticsearch rejected for overload stay dropped. Retrying them adds load. */
+    static List<BulkOperation> operationsToRetry(BulkRequest request, BulkResponse response) {
+        List<BulkOperation> operations = request.operations();
+        if (operations == null || operations.isEmpty()) {
+            return List.of();
+        }
+        List<BulkOperation> retryable = new ArrayList<>();
+        int itemCount = Math.min(operations.size(), response.items().size());
+        for (int i = 0; i < itemCount; i++) {
+            BulkResponseItem item = response.items().get(i);
+            if (item.error() != null && !isRejected(item.error())) {
+                retryable.add(operations.get(i));
+            }
+        }
+        return retryable;
+    }
+
+    private static boolean isRejected(ErrorCause error) {
+        if (error == null) {
+            return false;
+        }
+        String type = error.type();
+        if (type != null && type.contains("es_rejected_execution_exception")) {
+            return true;
+        }
+        return isRejected(error.causedBy());
+    }
+
+    private static boolean isTooManyRequests(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof ResponseException responseException
+                    && responseException.getResponse().getStatusLine().getStatusCode() == 429) {
+                return true;
+            }
+            if (current instanceof ElasticsearchException elasticsearchException
+                    && elasticsearchException.status() == 429) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private void retryFailedOperations(String docType, List<BulkOperation> failedOperations) {

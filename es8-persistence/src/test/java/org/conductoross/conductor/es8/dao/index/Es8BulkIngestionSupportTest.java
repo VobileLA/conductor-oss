@@ -137,4 +137,59 @@ public class Es8BulkIngestionSupportTest {
         assertEquals(1, failedOperations.size());
         assertEquals("workflow-2", failedOperations.getFirst().update().id());
     }
+
+    @Test
+    public void operationsToRetryDropsElasticsearchRejections() {
+        BulkOperation rejected =
+                BulkOperation.of(
+                        op ->
+                                op.index(
+                                        i ->
+                                                i.index("conductor_task")
+                                                        .id("task-rejected")
+                                                        .document(Map.of())));
+        BulkOperation retryable =
+                BulkOperation.of(
+                        op ->
+                                op.index(
+                                        i ->
+                                                i.index("conductor_task")
+                                                        .id("task-retry")
+                                                        .document(Map.of())));
+        BulkRequest request = BulkRequest.of(b -> b.operations(rejected, retryable));
+        BulkResponseItem rejectedItem =
+                BulkResponseItem.of(
+                        i ->
+                                i.operationType(OperationType.Index)
+                                        .index("conductor_task")
+                                        .id("task-rejected")
+                                        .status(429)
+                                        .error(
+                                                ErrorCause.of(
+                                                        e ->
+                                                                e.type(
+                                                                                "es_rejected_execution_exception")
+                                                                        .reason("busy"))));
+        BulkResponseItem retryableItem =
+                BulkResponseItem.of(
+                        i ->
+                                i.operationType(OperationType.Index)
+                                        .index("conductor_task")
+                                        .id("task-retry")
+                                        .status(400)
+                                        .error(
+                                                ErrorCause.of(
+                                                        e ->
+                                                                e.type("mapper_parsing_exception")
+                                                                        .reason("bad doc"))));
+        BulkResponse response =
+                BulkResponse.of(
+                        b -> b.errors(true).items(rejectedItem, retryableItem).took(1L));
+
+        List<BulkOperation> retryableOperations =
+                Es8BulkIngestionSupport.operationsToRetry(request, response);
+
+        assertEquals(1, retryableOperations.size());
+        assertEquals("task-retry", retryableOperations.getFirst().index().id());
+    }
 }
