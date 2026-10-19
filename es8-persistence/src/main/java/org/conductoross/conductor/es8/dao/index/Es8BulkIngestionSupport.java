@@ -14,6 +14,7 @@ package org.conductoross.conductor.es8.dao.index;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -39,10 +40,16 @@ import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
 
-/** Owns async bulk ingestion setup and lifecycle for ES8 indexing writes. */
+/**
+     * Owns async bulk ingestion for ES8 index and partial-update writes. Archival updates share
+     * the same ingester, batch size, and flush interval as document indexing.
+     */
 class Es8BulkIngestionSupport {
 
     private static final Logger logger = LoggerFactory.getLogger(Es8BulkIngestionSupport.class);
+
+    /** Flush a batch early when full workflow documents would make it too large for one request. */
+    private static final long BULK_MAX_BYTES = 10L * 1024 * 1024;
 
     private final ElasticsearchClient elasticSearchClient;
     private final ElasticsearchAsyncClient elasticSearchAsyncClient;
@@ -118,6 +125,29 @@ class Es8BulkIngestionSupport {
         ingester.add(operation);
     }
 
+    /**
+     * Enqueue a partial document update on the same bulk ingester as {@link #indexObject}. A
+     * non-null refresh policy stays synchronous so callers that wait for visibility still see the
+     * write before this method returns.
+     */
+    void updateObject(String index, String docType, String docId, Map<String, Object> partial) {
+        Refresh refreshPolicy = defaultRefreshPolicy();
+        if (refreshPolicy != null) {
+            updateObjectSynchronously(index, docType, docId, partial, refreshPolicy);
+            return;
+        }
+
+        BulkOperation operation =
+                BulkOperation.of(
+                        op ->
+                                op.update(
+                                        u ->
+                                                u.index(index)
+                                                        .id(docId)
+                                                        .action(a -> a.doc(partial))));
+        getBulkIngester(docType, null).add(operation);
+    }
+
     private Refresh defaultRefreshPolicy() {
         if (properties.isRefreshOnWrite()) {
             return Refresh.True;
@@ -151,6 +181,30 @@ class Es8BulkIngestionSupport {
             Monitors.error(className, "index");
             throw new RuntimeException(
                     String.format("Synchronous index failed for doc type %s", docType), e);
+        }
+    }
+
+    private void updateObjectSynchronously(
+            String index,
+            String docType,
+            String docId,
+            Map<String, Object> partial,
+            Refresh refreshPolicy) {
+        long startTime = System.currentTimeMillis();
+        try {
+            retryTemplate.execute(
+                    context -> {
+                        elasticSearchClient.update(
+                                u -> u.index(index).id(docId).doc(partial).refresh(refreshPolicy),
+                                Map.class);
+                        return null;
+                    });
+            Monitors.recordESIndexTime(
+                    "update_object", docType, System.currentTimeMillis() - startTime);
+        } catch (Exception e) {
+            Monitors.error(className, "update");
+            throw new RuntimeException(
+                    String.format("Synchronous update failed for doc type %s", docType), e);
         }
     }
 
@@ -236,6 +290,7 @@ class Es8BulkIngestionSupport {
                 builder -> {
                     builder.client(elasticSearchAsyncClient);
                     builder.maxOperations(indexBatchSize);
+                    builder.maxSize(BULK_MAX_BYTES);
                     builder.maxConcurrentRequests(
                             Math.max(1, Math.min(4, properties.getAsyncMaxPoolSize())));
                     if (asyncBufferFlushTimeout > 0) {
