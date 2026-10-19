@@ -77,4 +77,64 @@ public class Es8BulkIngestionSupportTest {
         assertEquals(1, failedOperations.size());
         assertEquals("task-2", failedOperations.getFirst().index().id());
     }
+
+    @Test
+    public void collectFailedOperationsKeepsFailedPartialUpdates() {
+        BulkOperation op1 =
+                BulkOperation.of(
+                        op ->
+                                op.update(
+                                        u ->
+                                                u.index("conductor_workflow")
+                                                        .id("workflow-1")
+                                                        .action(
+                                                                a ->
+                                                                        a.doc(
+                                                                                Map.of(
+                                                                                        "archived",
+                                                                                        true)))));
+        BulkOperation op2 =
+                BulkOperation.of(
+                        op ->
+                                op.update(
+                                        u ->
+                                                u.index("conductor_workflow")
+                                                        .id("workflow-2")
+                                                        .action(
+                                                                a ->
+                                                                        a.doc(
+                                                                                Map.of(
+                                                                                        "archived",
+                                                                                        true)))));
+
+        BulkRequest request = BulkRequest.of(b -> b.operations(op1, op2));
+
+        BulkResponseItem successItem =
+                BulkResponseItem.of(
+                        i ->
+                                i.operationType(OperationType.Update)
+                                        .index("conductor_workflow")
+                                        .id("workflow-1")
+                                        .status(200));
+        BulkResponseItem failedItem =
+                BulkResponseItem.of(
+                        i ->
+                                i.operationType(OperationType.Update)
+                                        .index("conductor_workflow")
+                                        .id("workflow-2")
+                                        .status(404)
+                                        .error(
+                                                ErrorCause.of(
+                                                        e ->
+                                                                e.type("document_missing_exception")
+                                                                        .reason("not found"))));
+        BulkResponse response =
+                BulkResponse.of(b -> b.errors(true).items(successItem, failedItem).took(1L));
+
+        List<BulkOperation> failedOperations =
+                Es8BulkIngestionSupport.collectFailedOperations(request, response);
+
+        assertEquals(1, failedOperations.size());
+        assertEquals("workflow-2", failedOperations.getFirst().update().id());
+    }
 }

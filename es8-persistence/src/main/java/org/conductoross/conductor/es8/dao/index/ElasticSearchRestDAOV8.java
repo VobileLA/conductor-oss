@@ -760,7 +760,8 @@ public class ElasticSearchRestDAOV8 implements IndexDAO {
         logger.debug("Updating workflow {} with {}", workflowInstanceId, source);
         try {
             UpdateOutcome outcome =
-                    updateByIdWithIlmFallback(workflowIndexName, workflowInstanceId, source);
+                    updateByIdWithIlmFallback(
+                            workflowIndexName, WORKFLOW_DOC_TYPE, workflowInstanceId, source);
             if (outcome == UpdateOutcome.NOT_FOUND) {
                 throw new NotFoundException(
                         "Workflow %s not found in index alias %s",
@@ -926,7 +927,8 @@ public class ElasticSearchRestDAOV8 implements IndexDAO {
 
         logger.debug("Updating task: {} of workflow: {} with {}", taskId, workflowId, source);
         try {
-            UpdateOutcome outcome = updateByIdWithIlmFallback(taskIndexName, taskId, source);
+            UpdateOutcome outcome =
+                    updateByIdWithIlmFallback(taskIndexName, TASK_DOC_TYPE, taskId, source);
             if (outcome == UpdateOutcome.NOT_FOUND) {
                 throw new NotFoundException(
                         "Task %s not found in index alias %s", taskId, taskIndexName);
@@ -959,13 +961,13 @@ public class ElasticSearchRestDAOV8 implements IndexDAO {
     }
 
     /**
-     * With ILM rollover, an alias write index may not contain the requested document (it might live
-     * in an older backing index). This method first attempts an update against the alias; on
-     * NOT_FOUND, it resolves the backing index via an ids query and retries the update against that
-     * index.
+     * Locate the backing index, then apply the partial update. When refresh is disabled the update
+     * is enqueued on the shared bulk ingester (the archival path). A refresh policy keeps the
+     * synchronous update, including one retry against the alias if the cached index was wrong.
      */
     private UpdateOutcome updateByIdWithIlmFallback(
-            String indexAlias, String id, Map<String, Object> source) throws IOException {
+            String indexAlias, String docType, String id, Map<String, Object> source)
+            throws IOException {
         Optional<String> located = locateDocumentIndex(indexAlias, id, Optional.empty());
         if (located.isEmpty()) {
             return UpdateOutcome.NOT_FOUND;
@@ -978,6 +980,11 @@ public class ElasticSearchRestDAOV8 implements IndexDAO {
                     id,
                     indexAlias);
             return UpdateOutcome.SKIPPED_STALE;
+        }
+
+        if (writeRefreshPolicy() == null) {
+            bulkIngestionSupport.updateObject(targetIndex, docType, id, source);
+            return UpdateOutcome.UPDATED;
         }
 
         UpdateOutcome outcome = updateById(targetIndex, id, source);
