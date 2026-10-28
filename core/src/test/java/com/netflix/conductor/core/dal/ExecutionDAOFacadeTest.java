@@ -16,13 +16,16 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import org.apache.commons.io.IOUtils;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.junit4.SpringRunner;
@@ -32,6 +35,7 @@ import com.netflix.conductor.common.metadata.events.EventExecution;
 import com.netflix.conductor.common.metadata.workflow.WorkflowDef;
 import com.netflix.conductor.common.run.SearchResult;
 import com.netflix.conductor.common.run.Workflow;
+import com.netflix.conductor.common.run.WorkflowSummary;
 import com.netflix.conductor.common.utils.ExternalPayloadStorage;
 import com.netflix.conductor.core.config.ConductorProperties;
 import com.netflix.conductor.core.exception.NotFoundException;
@@ -238,6 +242,53 @@ public class ExecutionDAOFacadeTest {
         verify(indexDAO, times(15)).updateTask(anyString(), anyString(), any(), any());
         verify(indexDAO, never()).removeWorkflow(anyString());
         verify(indexDAO, never()).removeTask(anyString(), anyString());
+    }
+
+    @Test
+    public void testArchiveWorkflowPatchesTerminalSummaryWithoutUpdateTime() {
+        WorkflowDef workflowDef = new WorkflowDef();
+        workflowDef.setName("keyword_music_fingerprinting_process_pex");
+        workflowDef.setVersion(4);
+
+        WorkflowModel workflow = new WorkflowModel();
+        workflow.setWorkflowDefinition(workflowDef);
+        workflow.setWorkflowId("workflowId");
+        workflow.setStatus(WorkflowModel.Status.FAILED);
+        workflow.setCreateTime(1_000L);
+        workflow.setEndTime(5_000L);
+        workflow.setUpdatedTime(5_000L);
+        workflow.getOutput().put("claim", "done");
+        workflow.setReasonForIncompletion("pex timeout");
+        workflow.getFailedReferenceTaskNames().add("inactivate_original_claim_ref");
+        workflow.getFailedTaskNames().add("music_fingerprinting_inactivate_original_claim");
+
+        when(executionDAO.getWorkflow(anyString(), anyBoolean())).thenReturn(workflow);
+        executionDAOFacade.removeWorkflow("workflowId", true);
+
+        ArgumentCaptor<String[]> keysCaptor = ArgumentCaptor.forClass(String[].class);
+        ArgumentCaptor<Object[]> valuesCaptor = ArgumentCaptor.forClass(Object[].class);
+        verify(indexDAO)
+                .updateWorkflow(eq("workflowId"), keysCaptor.capture(), valuesCaptor.capture());
+
+        Map<String, Object> updated = new HashMap<>();
+        String[] keys = keysCaptor.getValue();
+        Object[] values = valuesCaptor.getValue();
+        for (int i = 0; i < keys.length; i++) {
+            updated.put(keys[i], values[i]);
+        }
+
+        WorkflowSummary summary = new WorkflowSummary(workflow.toWorkflow());
+        assertEquals(Boolean.TRUE, updated.get("archived"));
+        assertTrue(updated.get("rawJSON").toString().contains("workflowId"));
+        assertEquals(summary.getStatus(), updated.get("status"));
+        assertEquals(summary.getEndTime(), updated.get("endTime"));
+        assertEquals(summary.getExecutionTime(), updated.get("executionTime"));
+        assertEquals(summary.getOutput(), updated.get("output"));
+        assertEquals(summary.getReasonForIncompletion(), updated.get("reasonForIncompletion"));
+        assertEquals(
+                summary.getFailedReferenceTaskNames(), updated.get("failedReferenceTaskNames"));
+        assertEquals(summary.getFailedTaskNames(), updated.get("failedTaskNames"));
+        assertFalse(updated.containsKey("updateTime"));
     }
 
     @Test

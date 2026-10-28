@@ -13,6 +13,7 @@
 package com.netflix.conductor.core.dal;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -427,12 +428,9 @@ public class ExecutionDAOFacade {
             throws JsonProcessingException {
         if (archiveWorkflow) {
             if (workflow.getStatus().isTerminal()) {
-                // Only allow archival if workflow is in terminal state
-                // DO NOT archive async, since if archival errors out, workflow data will be lost
-                indexDAO.updateWorkflow(
-                        workflow.getWorkflowId(),
-                        new String[] {RAW_JSON_FIELD, ARCHIVED_FIELD},
-                        new Object[] {objectMapper.writeValueAsString(workflow), true});
+                // Only allow archival if workflow is in terminal state.
+                // Do not archive async: a failed index write must leave the workflow in Redis.
+                archiveWorkflowInIndex(workflow);
             } else {
                 throw new IllegalArgumentException(
                         String.format(
@@ -442,6 +440,43 @@ public class ExecutionDAOFacade {
         } else {
             // Not archiving, also remove workflow from index
             indexDAO.asyncRemoveWorkflow(workflow.getWorkflowId());
+        }
+    }
+
+    /**
+     * Writes the archived body and the terminal search summary in one partial update.
+     *
+     * <p>Live indexing replaces the whole summary document through an unversioned bulk request, so
+     * an older RUNNING snapshot can be applied after the terminal one. Archival runs later and is
+     * the write the search document keeps. {@code updateTime} is not included: the index layer
+     * skips a partial update whose {@code updateTime} is older than the indexed document, and that
+     * skip would drop {@code rawJSON} before Redis removal.
+     */
+    private void archiveWorkflowInIndex(WorkflowModel workflow) throws JsonProcessingException {
+        WorkflowSummary summary = new WorkflowSummary(workflow.toWorkflow());
+        List<String> keys = new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        addArchiveField(keys, values, RAW_JSON_FIELD, objectMapper.writeValueAsString(workflow));
+        addArchiveField(keys, values, ARCHIVED_FIELD, true);
+        addArchiveField(keys, values, "status", summary.getStatus());
+        addArchiveField(keys, values, "endTime", summary.getEndTime());
+        addArchiveField(keys, values, "output", summary.getOutput());
+        addArchiveField(keys, values, "reasonForIncompletion", summary.getReasonForIncompletion());
+        addArchiveField(
+                keys, values, "failedReferenceTaskNames", summary.getFailedReferenceTaskNames());
+        addArchiveField(keys, values, "failedTaskNames", summary.getFailedTaskNames());
+        if (summary.getEndTime() != null) {
+            addArchiveField(keys, values, "executionTime", summary.getExecutionTime());
+        }
+        indexDAO.updateWorkflow(
+                workflow.getWorkflowId(), keys.toArray(new String[0]), values.toArray());
+    }
+
+    private static void addArchiveField(
+            List<String> keys, List<Object> values, String key, Object value) {
+        if (value != null) {
+            keys.add(key);
+            values.add(value);
         }
     }
 
